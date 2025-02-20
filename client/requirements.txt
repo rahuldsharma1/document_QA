@@ -1,0 +1,6 @@
+fastapi==0.115.8
+pymupdf
+openai==1.63.2
+pinecone==6.0.1
+python-dotenv==1.0.1
+uvicorn==0.34.0
