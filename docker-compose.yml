@@ -6,8 +6,11 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      - ./backend/.env  # Ensure this file exists
+    volumes:
+      - ./backend:/app   # Mount the backend folder
     restart: always
+
 
   frontend:
     build:

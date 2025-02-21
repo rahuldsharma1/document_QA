@@ -24,7 +24,10 @@ RUN apt-get update && apt-get install -y \
 
 # Copy and install dependencies.
 COPY requirements.txt /app/
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
+
+COPY .env /app/
 
 # Copy the backend source code.
 COPY . /app/
