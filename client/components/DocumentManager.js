@@ -80,6 +80,7 @@ export default function DocumentManager() {
       });
       // Remove the doc from local state
       setUploadedDocs((prev) => prev.filter(doc => doc.fileId !== fileId));
+      setPreviewText('');
     } catch (error) {
       console.error("Delete failed:", error);
     }
