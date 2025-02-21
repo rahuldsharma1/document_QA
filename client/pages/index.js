@@ -1,25 +1,28 @@
-import React from 'react';
-import { Box, Typography } from '@mui/material';
-import FileUploader from '../components/FileUploader';
+import React, { useState } from 'react';
+import { Grid, Box, Typography } from '@mui/material';
+import DocumentManager from '../components/DocumentManager';
 import ChatBox from '../components/ChatBox';
+import ReferencesPanel from '../components/ReferencesPanel';
 
 export default function HomePage() {
+  const [references, setReferences] = useState([]);
+
   return (
-    <Box
-      sx={{
-        maxWidth: '900px',
-        margin: '0 auto',
-        padding: '2rem',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: 4,
-      }}
-    >
-      <Typography variant="h4" textAlign="center">
-        Document Q&A Agent
+    <Box sx={{ flexGrow: 1, padding: 2 }}>
+      <Typography variant="h4" textAlign="center" sx={{ mb: 3 }}>
+        DocuDive!
       </Typography>
-      <FileUploader />
-      <ChatBox />
+      <Grid container spacing={2}>
+        <Grid item xs={12} md={3}>
+          <DocumentManager />
+        </Grid>
+        <Grid item xs={12} md={6}>
+          <ChatBox onNewResponse={setReferences} />
+        </Grid>
+        <Grid item xs={12} md={3}>
+          <ReferencesPanel references={references} />
+        </Grid>
+      </Grid>
     </Box>
   );
 }
