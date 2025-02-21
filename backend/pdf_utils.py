@@ -3,8 +3,8 @@ import nltk
 from nltk.tokenize import sent_tokenize
 import tiktoken
 
-nltk.download('punkt', quiet=True)  # Ensure 'punkt' is downloaded
-nltk.download('punkt_tab')
+# Ensure the sentence tokenizer is available
+nltk.download('punkt', quiet=True)
 
 def extract_text_from_pdf(file_path: str) -> str:
     """Extracts text from a PDF file."""
@@ -16,8 +16,8 @@ def extract_text_from_pdf(file_path: str) -> str:
 
 def semantic_chunk_text(text: str, max_tokens: int = 300, model_name: str = "text-embedding-ada-002") -> list:
     """
-    Splits text into semantically coherent chunks by sentences,
-    ensuring each chunk is at most max_tokens (approx).
+    Splits text into semantically coherent chunks using sentence boundaries.
+    Accumulates sentences until reaching max_tokens (approximately).
     """
     encoding = tiktoken.encoding_for_model(model_name)
     sentences = sent_tokenize(text)
@@ -28,13 +28,15 @@ def semantic_chunk_text(text: str, max_tokens: int = 300, model_name: str = "tex
         tentative = (current_chunk + " " + sentence).strip() if current_chunk else sentence
         token_count = len(encoding.encode(tentative))
         if token_count > max_tokens and current_chunk:
-            # finalize the current chunk
             chunks.append(current_chunk.strip())
-            current_chunk = sentence  # start a new chunk
+            current_chunk = sentence
         else:
             current_chunk = tentative
 
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
-
     return chunks
+
+# For compatibility, expose chunk_text as semantic_chunk_text
+def chunk_text(text: str, max_tokens: int = 300, model_name: str = "text-embedding-ada-002") -> list:
+    return semantic_chunk_text(text, max_tokens, model_name)
