@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
-import shutil, os, uuid
-import re  # for parsing citations
+import shutil, os, uuid, re
+import logging
 from pdf_utils import extract_text_from_pdf, semantic_chunk_text
 from embedding_utils import get_embedding
 from pinecone_utils import upsert_embedding, query_pinecone, index
@@ -11,6 +11,10 @@ from contextlib import asynccontextmanager
 from pydantic import BaseModel
 from fastapi.responses import FileResponse
 
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
@@ -18,9 +22,9 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 async def lifespan(app: FastAPI):
     try:
         index.delete(deleteAll=True)
-        print("Pinecone index cleared on startup.")
+        logger.info("Pinecone index cleared on startup.")
     except Exception as e:
-        print("Error clearing Pinecone index:", e)
+        logger.error(f"Error clearing Pinecone index: {e}")
     yield
 
 app = FastAPI(lifespan=lifespan)
@@ -62,6 +66,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
+
+    logger.info("File uploaded: %s", file.filename)
     
     text = extract_text_from_pdf(file_path)
     chunks = semantic_chunk_text(text)
@@ -71,6 +77,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     
     uploaded_docs.append((file_id, file.filename.lower()))
     preview = text[:200]
+    logger.info("File %s processed into %d chunks", file.filename, len(chunks))
     return {"status": "success", "file_id": file_id, "chunks": len(chunks), "preview": preview}
 
 ##############################
@@ -83,6 +90,7 @@ async def delete_document(delete_req: DeleteRequest):
     response = index.delete(ids=vector_ids)
     global uploaded_docs
     uploaded_docs = [doc for doc in uploaded_docs if doc[0] != doc_id]
+    logger.info("Document deleted: %s", doc_id)
     return {"status": "deleted", "doc_id": doc_id, "response": response}
 
 ##############################
@@ -91,6 +99,7 @@ async def delete_document(delete_req: DeleteRequest):
 @app.get("/download")
 async def download_file(doc_id: str, filename: str):
     file_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
+    logger.info("File downloaded: %s", filename)
     return FileResponse(file_path, media_type="application/pdf", filename=filename)
 
 ##############################
@@ -98,9 +107,10 @@ async def download_file(doc_id: str, filename: str):
 ##############################
 def classify_query_with_llm(question: str) -> str:
     prompt = f"""
-You are a classification system. The user query is: "{question}"
-Respond with exactly one word from [general, single, multi, none].
-"""
+        You are a classification system. The user query is: "{question}"
+        Respond with exactly one word from [general, single, multi, none].
+        """
+    logger.info("Classifying query: %s", question)
     resp = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -111,18 +121,18 @@ Respond with exactly one word from [general, single, multi, none].
         max_tokens=10
     )
     c = resp.choices[0].message.content.strip().lower()
-    if c not in {"general", "single", "multi", "none"}:
-        c = "none"
-    return c
+    logger.info("Query classification result: %s", c)
+
+    return c if c in {"general", "single", "multi", "none"} else "none"
 
 ##############################
 # Small Talk Response for General/None Queries
 ##############################
 def small_talk_llm_response(question: str) -> str:
     st_prompt = f"""
-You are a friendly AI assistant. The user said: "{question}"
-Respond in a natural conversational style.
-"""
+        You are a friendly AI assistant. The user said: "{question}"
+        Respond in a natural conversational style.
+        """
     resp = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -185,12 +195,14 @@ async def query_document(question: str = Form(...)):
     classification = classify_query_with_llm(question)
     if classification in ["general", "none"]:
         answer = small_talk_llm_response(question)
+        logger.info("Returning small talk response.")
         return {"answer": answer, "sources": []}
     
     query_emb = get_embedding(question)
     final_matches = advanced_retrieval(query_emb, classification, score_threshold=0.2)
     if not final_matches:
         fallback = small_talk_llm_response(question)
+        logger.info("No relevant documents found. Returning small talk response.")
         return {"answer": fallback, "sources": []}
     
     # Build context, truncating each chunk to 200 tokens to avoid large prompts
@@ -202,17 +214,17 @@ async def query_document(question: str = Form(...)):
     context_text = "\n\n".join(context_lines)
     
     doc_prompt = f"""You are an expert assistant with access to the uploaded document excerpts.
-You have access to the relevant document(s) as provided below.
-Do not disclaim that you don't have access.
-Answer the following question using the context provided.
-Include inline citations in the format [1], [2], etc.
+        You have access to the relevant document(s) as provided below.
+        Do not disclaim that you don't have access.
+        Answer the following question using the context provided.
+        Include inline citations in the format [1], [2], etc.
 
-Context:
-{context_text}
+        Context:
+        {context_text}
 
-Question: {question}
+        Question: {question}
 
-Answer:"""
+        Answer:"""
     
     resp = client.chat.completions.create(
         model="gpt-4",
@@ -224,6 +236,8 @@ Answer:"""
         max_tokens=1500  # Increased budget to reduce truncation
     )
     answer = resp.choices[0].message.content
+
+    logger.info("Returning document-based answer.")
 
     # 1) Parse the answer for citations like [1], [2], etc.
     used_citations = set()
@@ -243,4 +257,5 @@ Answer:"""
 
 if __name__ == "__main__":
     import uvicorn
+    logging.info("Starting server...")
     uvicorn.run(app, host="0.0.0.0", port=8000)
