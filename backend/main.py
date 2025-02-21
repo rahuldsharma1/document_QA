@@ -1,17 +1,24 @@
-from fastapi import FastAPI, File, UploadFile, Form
+from fastapi import FastAPI, File, UploadFile, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 import shutil, os, uuid
-from pdf_utils import extract_text_from_pdf, chunk_text
+from pdf_utils import extract_text_from_pdf, semantic_chunk_text
 from embedding_utils import get_embedding
 from pinecone_utils import upsert_embedding, query_pinecone, index
 from openai import OpenAI
+from dotenv import load_dotenv
+from pydantic import BaseModel
+from fastapi.responses import FileResponse
 
-client = OpenAI()
-from fastapi.middleware.cors import CORSMiddleware
+load_dotenv()
+
+class DeleteRequest(BaseModel):
+    doc_id: str
+
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
-# Enable CORS for your frontend URL
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -25,69 +32,100 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
-    # Save file locally
     file_id = str(uuid.uuid4())
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}_{file.filename}")
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
-    # Extract text and chunk it
+    # Now use the new sentence-based chunking
     text = extract_text_from_pdf(file_path)
-    chunks = chunk_text(text)
+    chunks = semantic_chunk_text(text)
 
-    # For each chunk, generate its embedding and upsert to Pinecone
+    # For each chunk, embed and store
     for i, chunk in enumerate(chunks):
         embedding = get_embedding(chunk)
         upsert_embedding(file_id, i, embedding, chunk, file.filename)
 
-    return {"status": "success", "file_id": file_id, "chunks": len(chunks)}
+    preview = text[:200]
+    return {"status": "success", "file_id": file_id, "chunks": len(chunks), "preview": preview}
 
+def is_compare_query(query: str) -> bool:
+    """
+    Simple heuristic: if the query contains words like 'compare', 'difference',
+    or multiple doc references, we assume cross-doc.
+    """
+    query_lower = query.lower()
+    compare_keywords = ["compare", "difference", "versus", "vs", "both documents"]
+    return any(kw in query_lower for kw in compare_keywords)
+
+def advanced_retrieval(query_embedding, user_query, top_k=20, final_k=10):
+    """
+    1. Retrieve a large set (top_k=20) from Pinecone by similarity.
+    2. Sort by score (descending).
+    3. If user wants a comparison, ensure at least one chunk per doc.
+    4. Otherwise, pick top chunks from the highest doc(s).
+    5. Return final_k chunks total.
+    """
+    raw_matches = query_pinecone(query_embedding, top_k=top_k)
+    sorted_matches = sorted(raw_matches, key=lambda x: x.get("score", 0), reverse=True)
+
+    if is_compare_query(user_query):
+        # Ensure we pick at least one chunk from each doc
+        results = ensure_diversity(sorted_matches, desired=final_k)
+    else:
+        # Just pick top final_k from sorted list
+        results = sorted_matches[:final_k]
+
+    return results
+
+def ensure_diversity(matches, desired=10):
+    """
+    1. Group by filename, keep the highest score from each doc first.
+    2. If we still need more chunks, fill from the sorted list.
+    """
+    from collections import defaultdict
+    groups = defaultdict(lambda: None)
+
+    for m in matches:
+        meta = m.get("metadata", {})
+        fname = meta.get("filename", "unknown")
+        if groups[fname] is None:  # not yet picked from this doc
+            groups[fname] = m
+
+    # Start with one chunk from each doc
+    picks = list(groups.values())
+    picks = [p for p in picks if p is not None]
+
+    if len(picks) >= desired:
+        # If we already have enough, sort them by score and truncate
+        picks.sort(key=lambda x: x["score"], reverse=True)
+        return picks[:desired]
+    else:
+        # Fill remaining slots from the highest scoring matches
+        needed = desired - len(picks)
+        picked_ids = set(id(x) for x in picks)
+        for m in matches:
+            if id(m) not in picked_ids:
+                picks.append(m)
+                picked_ids.add(id(m))
+                if len(picks) >= desired:
+                    break
+        return picks
 
 @app.post("/query")
 async def query_document(question: str = Form(...)):
-    # Check for general conversation
     if question.lower().startswith("how are you"):
         return {"answer": "I'm an AI-powered Q&A agent ready to help you with your documents!", "sources": []}
 
-    # Generate the query embedding
     query_embedding = get_embedding(question)
-    
-    # Retrieve a larger set of candidates to allow for diversity (e.g. top 10)
-    top_k = 15
-    matches = query_pinecone(query_embedding, top_k=top_k)
-    
-    # Group matches by document using the 'filename' field in metadata.
-    # This ensures that we pick the best chunk from each document.
-    groups = {}
-    for match in matches:
-        metadata = match.get("metadata", {})
-        filename = metadata.get("filename", "unknown")
-        # If this document hasn't been seen or this match has a higher score, keep it.
-        if filename not in groups or match.get("score", 0) > groups[filename].get("score", 0):
-            groups[filename] = match
 
-    # Our diverse matches come from each distinct document.
-    diverse_matches = list(groups.values())
+    # Retrieve up to top 20, then produce final 10 chunks
+    matches = advanced_retrieval(query_embedding, question, top_k=20, final_k=10)
+    # Build the context
+    sorted_matches = sorted(matches, key=lambda x: x.get("score", 0), reverse=True)
+    chunks = [m["metadata"] for m in sorted_matches]
 
-    # If we have fewer than the desired number of chunks (e.g., 7), then fill up using the highest scoring remaining chunks.
-    desired = 10
-    if len(diverse_matches) < desired:
-        # Sort all matches by score (highest first)
-        sorted_matches = sorted(matches, key=lambda x: x.get("score", 0), reverse=True)
-        seen_filenames = set(match["metadata"].get("filename", "unknown") for match in diverse_matches)
-        for match in sorted_matches:
-            filename = match.get("metadata", {}).get("filename", "unknown")
-            if filename not in seen_filenames:
-                diverse_matches.append(match)
-                seen_filenames.add(filename)
-            if len(diverse_matches) >= desired:
-                break
-
-    # Extract metadata from the diverse matches for the prompt context.
-    diverse_chunks = [match["metadata"] for match in diverse_matches]
-
-    # Build the context by concatenating the text from each chunk.
-    context_text = "\n\n".join([f"Source: {chunk['text']}" for chunk in diverse_chunks])
+    context_text = "\n\n".join([f"Source: {c['text']}" for c in chunks])
     prompt = f"""You are an expert assistant. Answer the following question based on the context provided below. Cite the source passages used.
 
 Context:
@@ -97,7 +135,6 @@ Question: {question}
 
 Answer:"""
 
-    # Query the LLM (using OpenAI ChatCompletion)
     response = client.chat.completions.create(
         model="gpt-4",
         messages=[
@@ -108,9 +145,20 @@ Answer:"""
         max_tokens=300
     )
     answer = response.choices[0].message.content
-    return {"answer": answer, "sources": diverse_chunks}
+    # Return the final sorted chunks
+    return {"answer": answer, "sources": chunks}
 
+@app.delete("/delete")
+async def delete_document(delete_req: DeleteRequest):
+    doc_id = delete_req.doc_id
+    vector_ids = [f"{doc_id}_{i}" for i in range(1000)]
+    response = index.delete(ids=vector_ids)
+    return {"status": "deleted", "doc_id": doc_id, "response": response}
 
+@app.get("/download")
+async def download_file(doc_id: str, filename: str):
+    file_path = os.path.join(UPLOAD_DIR, f"{doc_id}_{filename}")
+    return FileResponse(file_path, media_type="application/pdf", filename=filename)
 
 if __name__ == "__main__":
     import uvicorn
